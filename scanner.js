@@ -20,13 +20,12 @@ const storage = getStorage(app);
 
 const DOWNLOAD_DIR = path.join(process.cwd(), 'downloads');
 const CUSTOMS_BASE = 'https://shaarolami-query.customs.mof.gov.il';
-const LINK_REPORTS_URL = `${CUSTOMS_BASE}/CustomspilotWeb/he/CustomsBook/Home/LinkReports`;
+const LINK_REPORTS_URL = CUSTOMS_BASE + '/CustomspilotWeb/he/CustomsBook/Home/LinkReports';
 
 function detectCategory(fileName) {
   const name = fileName.toLowerCase();
-  if (name.includes('תוספת') || name.includes('supplement') || name.includes('wto')) return 'supplement';
+  if (name.includes('תוספת') || name.includes('wto')) return 'supplement';
   if (name.includes('נוהל') || name.includes('פקודה')) return 'procedure';
-  if (name.includes('הסכם') || name.includes('agreement')) return 'agreement';
   return 'tariff';
 }
 
@@ -43,19 +42,21 @@ async function fileExists(fileName) {
 function downloadFile(url) {
   return new Promise((resolve, reject) => {
     const protocol = url.startsWith('https') ? https : http;
-    protocol.get(url, { 
-      headers: { 
+    const options = {
+      headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'application/pdf,*/*'
-      }
-    }, (response) => {
+      },
+      timeout: 60000
+    };
+    
+    protocol.get(url, options, (response) => {
       if (response.statusCode === 302 || response.statusCode === 301) {
-        // Follow redirect
         downloadFile(response.headers.location).then(resolve).catch(reject);
         return;
       }
       if (response.statusCode !== 200) {
-        reject(new Error(`HTTP ${response.statusCode}`));
+        reject(new Error('HTTP ' + response.statusCode));
         return;
       }
       const chunks = [];
@@ -70,7 +71,7 @@ async function uploadToFirebase(fileBuffer, fileName) {
   try {
     const category = detectCategory(fileName);
     const timestamp = Date.now();
-    const storagePath = `documents/${category}/${timestamp}_${fileName}`;
+    const storagePath = 'documents/' + category + '/' + timestamp + '_' + fileName;
     const storageRef = ref(storage, storagePath);
     
     await uploadBytes(storageRef, fileBuffer, { contentType: 'application/pdf' });
@@ -87,17 +88,17 @@ async function uploadToFirebase(fileBuffer, fileName) {
       source: 'auto-scanner'
     });
     
-    console.log(`✅ Uploaded: ${fileName} (${(fileBuffer.length / 1024 / 1024).toFixed(2)} MB)`);
+    console.log('✅ Uploaded: ' + fileName + ' (' + (fileBuffer.length / 1024 / 1024).toFixed(2) + ' MB)');
     return true;
   } catch (error) {
-    console.error(`❌ Upload error for ${fileName}:`, error.message);
+    console.error('❌ Upload error: ' + error.message);
     return false;
   }
 }
 
 async function runScanner() {
   console.log('🚀 Starting RPA-PORT Customs Scanner v3');
-  console.log(`📅 Time: ${new Date().toISOString()}`);
+  console.log('📅 Time: ' + new Date().toISOString());
   console.log('-----------------------------------');
   
   if (!fs.existsSync(DOWNLOAD_DIR)) {
@@ -112,26 +113,23 @@ async function runScanner() {
   
   const page = await browser.newPage();
   await page.setViewport({ width: 1920, height: 1080 });
-  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
   
-  // Track PDF URLs from network requests
-  const pdfUrls = [];
+  let pdfUrls = [];
   
   page.on('response', async (response) => {
     const url = response.url();
     const contentType = response.headers()['content-type'] || '';
-    
-    if (contentType.includes('pdf') || url.includes('.pdf') || url.includes('Download') || url.includes('Report')) {
-      console.log(`🔗 Detected URL: ${url}`);
+    if (contentType.includes('pdf') || url.includes('.pdf') || url.includes('Download')) {
+      console.log('🔗 Detected: ' + url);
       pdfUrls.push(url);
     }
   });
   
-  // Also track new pages/tabs that open
   browser.on('targetcreated', async (target) => {
     const url = target.url();
-    if (url && url !== 'about:blank') {
-      console.log(`🔗 New tab URL: ${url}`);
+    if (url && url !== 'about:blank' && !url.includes('LinkReports')) {
+      console.log('🔗 New tab: ' + url);
       pdfUrls.push(url);
     }
   });
@@ -140,8 +138,7 @@ async function runScanner() {
   let skipped = 0;
   let failed = 0;
   
-  // Items to download
-  const itemsToDownload = [
+  const items = [
     'הורדת קובץ התעריף',
     'I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X',
     'XI', 'XII', 'XIII', 'XIV', 'XV', 'XVI', 'XVII', 'XVIII', 'XIX', 'XX', 'XXI', 'XXII',
@@ -152,30 +149,28 @@ async function runScanner() {
   ];
   
   try {
-    console.log('📄 Loading customs tariff page...');
+    console.log('📄 Loading page...');
     await page.goto(LINK_REPORTS_URL, { waitUntil: 'networkidle0', timeout: 60000 });
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    await new Promise(r => setTimeout(r, 3000));
     
-    for (const itemName of itemsToDownload) {
-      const fileName = `${itemName.replace(/[^a-zA-Z0-9א-ת\s]/g, '').trim()}.pdf`;
-      console.log(`\n📄 Processing: "${itemName}"`);
+    for (const itemName of items) {
+      const fileName = itemName.replace(/[^a-zA-Z0-9א-ת\s]/g, '').trim() + '.pdf';
+      console.log('\n📄 Processing: ' + itemName);
       
       const exists = await fileExists(fileName);
       if (exists) {
-        console.log(`⏭️ Skipping (exists): ${fileName}`);
+        console.log('⏭️ Skipping (exists): ' + fileName);
         skipped++;
         continue;
       }
       
+      pdfUrls = [];
+      
       try {
-        // Clear tracked URLs
-        pdfUrls.length = 0;
-        
-        // Find and click the element
         const clicked = await page.evaluate((text) => {
-          const elements = document.querySelectorAll('span, a, li, div');
-          for (const el of elements) {
-            if (el.innerText?.trim() === text) {
+          const els = document.querySelectorAll('span, a, li, div');
+          for (const el of els) {
+            if (el.innerText && el.innerText.trim() === text) {
               el.click();
               return true;
             }
@@ -184,74 +179,95 @@ async function runScanner() {
         }, itemName);
         
         if (!clicked) {
-          console.log(`⚠️ Element not found: "${itemName}"`);
+          console.log('⚠️ Not found: ' + itemName);
           failed++;
           continue;
         }
         
-        console.log(`🖱️ Clicked: "${itemName}"`);
+        console.log('🖱️ Clicked: ' + itemName);
+        await new Promise(r => setTimeout(r, 5000));
         
-        // Wait for response
-        await new Promise(resolve => setTimeout(resolve, 5000));
-        
-        // Check if we got any PDF URLs
         if (pdfUrls.length > 0) {
           const pdfUrl = pdfUrls[pdfUrls.length - 1];
-          console.log(`📥 Downloading from: ${pdfUrl}`);
+          console.log('📥 Downloading: ' + pdfUrl);
           
-          try {
-            const fileBuffer = await downloadFile(pdfUrl);
-            if (fileBuffer && fileBuffer.length > 1000) {
-              const success = await uploadToFirebase(fileBuffer, fileName);
-              if (success) uploaded++;
-              else failed++;
-            } else {
-              console.log(`⚠️ Downloaded file too small or empty`);
-              failed++;
-            }
-          } catch (dlError) {
-            console.log(`⚠️ Download failed: ${dlError.message}`);
+          const fileBuffer = await downloadFile(pdfUrl);
+          if (fileBuffer && fileBuffer.length > 1000) {
+            const success = await uploadToFirebase(fileBuffer, fileName);
+            if (success) uploaded++;
+            else failed++;
+          } else {
+            console.log('⚠️ File too small');
             failed++;
           }
         } else {
-          // Try to get URL from any new pages
           const pages = await browser.pages();
+          let found = false;
           for (const p of pages) {
-            const url = p.url();
-            if (url !== LINK_REPORTS_URL && url !== 'about:blank') {
-              console.log(`📥 Found new page: ${url}`);
-              
+            const pUrl = p.url();
+            if (pUrl !== LINK_REPORTS_URL && pUrl !== 'about:blank') {
+              console.log('📥 From new tab: ' + pUrl);
               try {
-                const fileBuffer = await downloadFile(url);
-                if (fileBuffer && fileBuffer.length > 1000) {
-                  const success = await uploadToFirebase(fileBuffer, fileName);
+                const buf = await downloadFile(pUrl);
+                if (buf && buf.length > 1000) {
+                  const success = await uploadToFirebase(buf, fileName);
                   if (success) uploaded++;
                   else failed++;
+                  found = true;
                   await p.close();
                   break;
                 }
-              } catch (e) {
-                console.log(`⚠️ Could not download from new page`);
-              }
+              } catch (e) {}
             }
           }
-          
-          if (pdfUrls.length === 0) {
-            console.log(`⚠️ No PDF URL detected for: "${itemName}"`);
+          if (!found) {
+            console.log('⚠️ No PDF found for: ' + itemName);
             failed++;
           }
         }
         
-        // Go back to main page if needed
         if (page.url() !== LINK_REPORTS_URL) {
           await page.goto(LINK_REPORTS_URL, { waitUntil: 'networkidle0', timeout: 60000 });
-          await new Promise(resolve => setTimeout(resolve, 2000));
+          await new Promise(r => setTimeout(r, 2000));
         }
         
-      } catch (error) {
-        console.error(`❌ Error processing "${itemName}": ${error.message}`);
+      } catch (err) {
+        console.error('❌ Error: ' + err.message);
         failed++;
-        
-        // Try to recover
         try {
-          await page.goto(LINK_REPORTS_URL, { waitUntil: 'networkidle0', timeout: 6000
+          await page.goto(LINK_REPORTS_URL, { waitUntil: 'networkidle0', timeout: 60000 });
+        } catch (e) {}
+      }
+      
+      await new Promise(r => setTimeout(r, 1000));
+    }
+    
+  } catch (error) {
+    console.error('❌ Scanner error: ' + error.message);
+  } finally {
+    await browser.close();
+  }
+  
+  console.log('\n-----------------------------------');
+  console.log('📊 SCAN COMPLETE');
+  console.log('✅ Uploaded: ' + uploaded);
+  console.log('⏭️ Skipped: ' + skipped);
+  console.log('❌ Failed: ' + failed);
+  console.log('-----------------------------------');
+  
+  try {
+    await addDoc(collection(db, 'scanner_logs'), {
+      timestamp: serverTimestamp(),
+      uploaded: uploaded,
+      skipped: skipped,
+      failed: failed
+    });
+  } catch (e) {}
+}
+
+runScanner()
+  .then(() => process.exit(0))
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
