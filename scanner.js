@@ -16,29 +16,18 @@ const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 const storage = getStorage(app);
 
-// Download directory
 const DOWNLOAD_DIR = path.join(process.cwd(), 'downloads');
-
-// Customs URLs
 const CUSTOMS_BASE = 'https://shaarolami-query.customs.mof.gov.il';
 const LINK_REPORTS_URL = `${CUSTOMS_BASE}/CustomspilotWeb/he/CustomsBook/Home/LinkReports`;
 
-// Category detection
 function detectCategory(fileName) {
   const name = fileName.toLowerCase();
-  if (name.includes('תוספת') || name.includes('supplement') || name.includes('wto')) {
-    return 'supplement';
-  }
-  if (name.includes('נוהל') || name.includes('פקודה') || name.includes('הוראה')) {
-    return 'procedure';
-  }
-  if (name.includes('הסכם') || name.includes('agreement')) {
-    return 'agreement';
-  }
+  if (name.includes('תוספת') || name.includes('supplement') || name.includes('wto')) return 'supplement';
+  if (name.includes('נוהל') || name.includes('פקודה')) return 'procedure';
+  if (name.includes('הסכם') || name.includes('agreement')) return 'agreement';
   return 'tariff';
 }
 
-// Check if file exists in Firebase
 async function fileExists(fileName) {
   try {
     const q = query(collection(db, 'files'), where('name', '==', fileName));
@@ -49,7 +38,6 @@ async function fileExists(fileName) {
   }
 }
 
-// Upload to Firebase
 async function uploadToFirebase(filePath, fileName) {
   try {
     const fileBuffer = fs.readFileSync(filePath);
@@ -80,22 +68,34 @@ async function uploadToFirebase(filePath, fileName) {
   }
 }
 
-// Main scanner
+async function waitForDownload(directory, timeout = 60000) {
+  const startTime = Date.now();
+  while (Date.now() - startTime < timeout) {
+    const files = fs.readdirSync(directory);
+    const pdfFile = files.find(f => f.endsWith('.pdf') && !f.endsWith('.crdownload'));
+    if (pdfFile) return pdfFile;
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+  return null;
+}
+
 async function runScanner() {
-  console.log('🚀 Starting RPA-PORT Customs Scanner (Puppeteer)');
+  console.log('🚀 Starting RPA-PORT Customs Scanner v2');
   console.log(`📅 Time: ${new Date().toISOString()}`);
   console.log('-----------------------------------');
   
-  // Create download directory
   if (!fs.existsSync(DOWNLOAD_DIR)) {
     fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
   }
   
-  // Launch browser
+  // Clear download directory
+  const existingFiles = fs.readdirSync(DOWNLOAD_DIR);
+  existingFiles.forEach(f => fs.unlinkSync(path.join(DOWNLOAD_DIR, f)));
+  
   console.log('🌐 Launching browser...');
   const browser = await puppeteer.launch({
     headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
   });
   
   const page = await browser.newPage();
@@ -107,40 +107,83 @@ async function runScanner() {
     downloadPath: DOWNLOAD_DIR
   });
   
+  // Set viewport and user agent
+  await page.setViewport({ width: 1920, height: 1080 });
+  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+  
   let uploaded = 0;
   let skipped = 0;
   let failed = 0;
   
   try {
-    // Go to LinkReports page
     console.log('📄 Loading customs tariff page...');
-    await page.goto(LINK_REPORTS_URL, { waitUntil: 'networkidle2', timeout: 60000 });
+    await page.goto(LINK_REPORTS_URL, { waitUntil: 'networkidle0', timeout: 60000 });
     
-    // Wait for page to load
-    await page.waitForSelector('a', { timeout: 30000 });
+    // Wait for dynamic content
+    console.log('⏳ Waiting for dynamic content...');
+    await new Promise(resolve => setTimeout(resolve, 5000));
     
-    // Get all download links
-    const links = await page.evaluate(() => {
-      const anchors = document.querySelectorAll('a');
-      const downloadLinks = [];
-      anchors.forEach((a, index) => {
-        const text = a.innerText.trim();
-        const href = a.href;
-        if (text && href && (href.includes('Download') || href.includes('Report') || text.match(/^[IVX]+$|תוספת|קודי|צו/))) {
-          downloadLinks.push({ text, href, index });
+    // Take screenshot for debugging
+    await page.screenshot({ path: path.join(DOWNLOAD_DIR, 'page.png'), fullPage: true });
+    console.log('📸 Screenshot saved');
+    
+    // Get page HTML for debugging
+    const pageContent = await page.content();
+    console.log(`📝 Page content length: ${pageContent.length} chars`);
+    
+    // Find all clickable elements with download-related text
+    const downloadButtons = await page.evaluate(() => {
+      const results = [];
+      
+      // Find all links and buttons
+      const elements = document.querySelectorAll('a, button, li, span, div');
+      
+      elements.forEach((el, index) => {
+        const text = el.innerText?.trim() || '';
+        const onclick = el.getAttribute('onclick') || '';
+        const href = el.getAttribute('href') || '';
+        const className = el.className || '';
+        
+        // Match Roman numerals, Hebrew supplement names, etc.
+        const isDownloadLink = 
+          /^I{1,3}$|^IV$|^V$|^VI{1,3}$|^IX$|^X{1,3}$|^XI{1,3}$|^XIV$|^XV$|^XVI{1,3}$|^XIX$|^XX{1,2}$|^XXI{1,2}$/.test(text) ||
+          text.includes('תוספת') ||
+          text.includes('קודי הנחה') ||
+          text.includes('צו מסגרת') ||
+          text.includes('הורדת קובץ') ||
+          onclick.includes('Download') ||
+          href.includes('Download');
+        
+        if (isDownloadLink && text.length > 0 && text.length < 50) {
+          results.push({
+            text: text,
+            tagName: el.tagName,
+            index: index,
+            hasOnclick: onclick.length > 0,
+            hasHref: href.length > 0
+          });
         }
       });
-      return downloadLinks;
+      
+      return results;
     });
     
-    console.log(`📋 Found ${links.length} download links`);
+    console.log(`📋 Found ${downloadButtons.length} potential download elements:`);
+    downloadButtons.forEach(btn => console.log(`   - "${btn.text}" (${btn.tagName})`));
     
-    // Process each link
-    for (const link of links) {
-      const fileName = `${link.text.replace(/[^a-zA-Z0-9א-ת]/g, '_')}.pdf`;
-      console.log(`\n📄 Processing: ${fileName}`);
+    if (downloadButtons.length === 0) {
+      // Log all text on page for debugging
+      const allText = await page.evaluate(() => {
+        return Array.from(document.querySelectorAll('li, a')).map(el => el.innerText?.trim()).filter(t => t && t.length < 100);
+      });
+      console.log('📝 Page elements found:', allText.slice(0, 30));
+    }
+    
+    // Process each download button
+    for (const btn of downloadButtons) {
+      const fileName = `${btn.text.replace(/[^a-zA-Z0-9א-ת\s]/g, '').trim()}.pdf`;
+      console.log(`\n📄 Processing: "${btn.text}" -> ${fileName}`);
       
-      // Check if exists
       const exists = await fileExists(fileName);
       if (exists) {
         console.log(`⏭️ Skipping (exists): ${fileName}`);
@@ -149,40 +192,54 @@ async function runScanner() {
       }
       
       try {
-        // Click download link
-        const linkElement = await page.$(`a[href="${link.href}"]`);
-        if (linkElement) {
-          await linkElement.click();
-          
-          // Wait for download
-          await new Promise(resolve => setTimeout(resolve, 10000));
-          
-          // Find downloaded file
-          const files = fs.readdirSync(DOWNLOAD_DIR);
-          const newFile = files.find(f => f.endsWith('.pdf'));
-          
-          if (newFile) {
-            const filePath = path.join(DOWNLOAD_DIR, newFile);
-            const success = await uploadToFirebase(filePath, fileName);
-            
-            if (success) {
-              uploaded++;
-              fs.unlinkSync(filePath); // Clean up
-            } else {
-              failed++;
-            }
-          } else {
-            console.log(`⚠️ No PDF downloaded for: ${link.text}`);
-            failed++;
+        // Find and click the element
+        const elements = await page.$$('a, button, li, span');
+        let clicked = false;
+        
+        for (const element of elements) {
+          const text = await element.evaluate(el => el.innerText?.trim());
+          if (text === btn.text) {
+            await element.click();
+            clicked = true;
+            console.log(`🖱️ Clicked: "${btn.text}"`);
+            break;
           }
         }
+        
+        if (!clicked) {
+          console.log(`⚠️ Could not find element to click: "${btn.text}"`);
+          failed++;
+          continue;
+        }
+        
+        // Wait for download
+        console.log('⏳ Waiting for download...');
+        const downloadedFile = await waitForDownload(DOWNLOAD_DIR, 30000);
+        
+        if (downloadedFile) {
+          const filePath = path.join(DOWNLOAD_DIR, downloadedFile);
+          const success = await uploadToFirebase(filePath, fileName);
+          
+          if (success) {
+            uploaded++;
+          } else {
+            failed++;
+          }
+          
+          // Clean up
+          try { fs.unlinkSync(filePath); } catch (e) {}
+        } else {
+          console.log(`⚠️ No download received for: "${btn.text}"`);
+          failed++;
+        }
+        
       } catch (error) {
-        console.error(`❌ Error processing ${link.text}:`, error.message);
+        console.error(`❌ Error: ${error.message}`);
         failed++;
       }
       
-      // Delay between downloads
-      await new Promise(resolve => setTimeout(resolve, 3000));
+      // Small delay
+      await new Promise(resolve => setTimeout(resolve, 2000));
     }
     
   } catch (error) {
@@ -198,13 +255,10 @@ async function runScanner() {
   console.log(`❌ Failed: ${failed}`);
   console.log('-----------------------------------');
   
-  // Log to Firestore
   try {
     await addDoc(collection(db, 'scanner_logs'), {
       timestamp: serverTimestamp(),
-      uploaded,
-      skipped,
-      failed
+      uploaded, skipped, failed
     });
   } catch (e) {}
 }
