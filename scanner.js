@@ -1,86 +1,67 @@
+const puppeteer = require('puppeteer');
 const { initializeApp } = require('firebase/app');
 const { getFirestore, collection, addDoc, getDocs, query, where, serverTimestamp } = require('firebase/firestore');
 const { getStorage, ref, uploadBytes, getDownloadURL } = require('firebase/storage');
-const axios = require('axios');
-const cheerio = require('cheerio');
+const fs = require('fs');
+const path = require('path');
 
-// Firebase Config from GitHub Secrets
+// Firebase Config
 const firebaseConfig = {
   apiKey: process.env.FIREBASE_API_KEY,
   projectId: process.env.FIREBASE_PROJECT_ID,
   storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
 };
 
-// Initialize Firebase
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 const storage = getStorage(app);
 
-// Customs website URLs
-const CUSTOMS_BASE_URL = 'https://shaarolami-query.customs.mof.gov.il';
-const CUSTOMS_BOOK_URL = `${CUSTOMS_BASE_URL}/CustomspilotWeb/he/CustomsBook/Home/LinkReports`;
+// Download directory
+const DOWNLOAD_DIR = path.join(process.cwd(), 'downloads');
 
-// File categories detection
+// Customs URLs
+const CUSTOMS_BASE = 'https://shaarolami-query.customs.mof.gov.il';
+const LINK_REPORTS_URL = `${CUSTOMS_BASE}/CustomspilotWeb/he/CustomsBook/Home/LinkReports`;
+
+// Category detection
 function detectCategory(fileName) {
   const name = fileName.toLowerCase();
-  
   if (name.includes('תוספת') || name.includes('supplement') || name.includes('wto')) {
-    return { category: 'supplement', label: 'תוספת' };
+    return 'supplement';
   }
-  if (name.includes('נוהל') || name.includes('procedure') || name.includes('פקודה')) {
-    return { category: 'procedure', label: 'נהלים' };
+  if (name.includes('נוהל') || name.includes('פקודה') || name.includes('הוראה')) {
+    return 'procedure';
   }
-  if (name.includes('הסכם') || name.includes('agreement') || name.includes('fta')) {
-    return { category: 'agreement', label: 'הסכם' };
+  if (name.includes('הסכם') || name.includes('agreement')) {
+    return 'agreement';
   }
-  return { category: 'tariff', label: 'תעריף' };
+  return 'tariff';
 }
 
-// Check if file already exists in database
+// Check if file exists in Firebase
 async function fileExists(fileName) {
   try {
     const q = query(collection(db, 'files'), where('name', '==', fileName));
     const snapshot = await getDocs(q);
     return !snapshot.empty;
   } catch (error) {
-    console.error('Error checking file existence:', error);
     return false;
   }
 }
 
-// Download file from URL
-async function downloadFile(url) {
+// Upload to Firebase
+async function uploadToFirebase(filePath, fileName) {
   try {
-    const response = await axios.get(url, {
-      responseType: 'arraybuffer',
-      timeout: 120000, // 2 minutes timeout
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
-    });
-    return Buffer.from(response.data);
-  } catch (error) {
-    console.error(`Error downloading ${url}:`, error.message);
-    return null;
-  }
-}
-
-// Upload file to Firebase Storage
-async function uploadToFirebase(fileName, fileBuffer, category) {
-  try {
+    const fileBuffer = fs.readFileSync(filePath);
+    const category = detectCategory(fileName);
     const timestamp = Date.now();
     const storagePath = `documents/${category}/${timestamp}_${fileName}`;
     const storageRef = ref(storage, storagePath);
     
-    // Upload to Storage
-    await uploadBytes(storageRef, fileBuffer, {
-      contentType: 'application/pdf'
-    });
-    
+    await uploadBytes(storageRef, fileBuffer, { contentType: 'application/pdf' });
     const downloadURL = await getDownloadURL(storageRef);
     
-    // Save metadata to Firestore
-    const docRef = await addDoc(collection(db, 'files'), {
+    await addDoc(collection(db, 'files'), {
       name: fileName,
       size: fileBuffer.length,
       type: 'application/pdf',
@@ -92,127 +73,128 @@ async function uploadToFirebase(fileName, fileBuffer, category) {
     });
     
     console.log(`✅ Uploaded: ${fileName} (${(fileBuffer.length / 1024 / 1024).toFixed(2)} MB)`);
-    return docRef.id;
-    
+    return true;
   } catch (error) {
-    console.error(`❌ Error uploading ${fileName}:`, error.message);
-    return null;
+    console.error(`❌ Upload error for ${fileName}:`, error.message);
+    return false;
   }
 }
 
-// Scrape customs website for PDF links
-async function scrapeCustomsLinks() {
-  console.log('🔍 Scanning customs website...');
-  
-  try {
-    const response = await axios.get(CUSTOMS_BOOK_URL, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
-    });
-    
-    const $ = cheerio.load(response.data);
-    const links = [];
-    
-    // Find all links that might be PDF downloads
-    $('a').each((i, elem) => {
-      const href = $(elem).attr('href');
-      const text = $(elem).text().trim();
-      
-      if (href && (href.includes('Download') || href.includes('Report') || href.includes('pdf'))) {
-        const fullUrl = href.startsWith('http') ? href : `${CUSTOMS_BASE_URL}${href}`;
-        links.push({ url: fullUrl, name: text || `file_${i}` });
-      }
-    });
-    
-    console.log(`📋 Found ${links.length} potential download links`);
-    return links;
-    
-  } catch (error) {
-    console.error('Error scraping customs website:', error.message);
-    return [];
-  }
-}
-
-// Known direct PDF URLs (backup list)
-const KNOWN_PDF_SECTIONS = [
-  { name: 'Section_I.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?section=1' },
-  { name: 'Section_II.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?section=2' },
-  { name: 'Section_III.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?section=3' },
-  { name: 'Section_IV.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?section=4' },
-  { name: 'Section_V.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?section=5' },
-  { name: 'Section_VI.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?section=6' },
-  { name: 'Section_VII.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?section=7' },
-  { name: 'Section_VIII.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?section=8' },
-  { name: 'Section_IX.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?section=9' },
-  { name: 'Section_X.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?section=10' },
-  { name: 'Section_XI.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?section=11' },
-  { name: 'Section_XII.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?section=12' },
-  { name: 'Section_XIII.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?section=13' },
-  { name: 'Section_XIV.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?section=14' },
-  { name: 'Section_XV.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?section=15' },
-  { name: 'Section_XVI.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?section=16' },
-  { name: 'Section_XVII.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?section=17' },
-  { name: 'Section_XVIII.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?section=18' },
-  { name: 'Section_XIX.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?section=19' },
-  { name: 'Section_XX.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?section=20' },
-  { name: 'Section_XXI.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?section=21' },
-  { name: 'Supplement_2_מסקניה.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?type=supplement2' },
-  { name: 'Supplement_3_WTO.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?type=supplement3' },
-  { name: 'Discount_Codes.pdf', path: '/CustomspilotWeb/he/CustomsBook/Home/DownloadReport?type=discountcodes' },
-];
-
-// Main scanner function
+// Main scanner
 async function runScanner() {
-  console.log('🚀 Starting RPA-PORT Customs Scanner');
+  console.log('🚀 Starting RPA-PORT Customs Scanner (Puppeteer)');
   console.log(`📅 Time: ${new Date().toISOString()}`);
   console.log('-----------------------------------');
+  
+  // Create download directory
+  if (!fs.existsSync(DOWNLOAD_DIR)) {
+    fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
+  }
+  
+  // Launch browser
+  console.log('🌐 Launching browser...');
+  const browser = await puppeteer.launch({
+    headless: 'new',
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+  });
+  
+  const page = await browser.newPage();
+  
+  // Set download behavior
+  const client = await page.target().createCDPSession();
+  await client.send('Page.setDownloadBehavior', {
+    behavior: 'allow',
+    downloadPath: DOWNLOAD_DIR
+  });
   
   let uploaded = 0;
   let skipped = 0;
   let failed = 0;
   
-  // Try known PDF URLs
-  for (const item of KNOWN_PDF_SECTIONS) {
-    const fileName = item.name;
-    const url = `${CUSTOMS_BASE_URL}${item.path}`;
+  try {
+    // Go to LinkReports page
+    console.log('📄 Loading customs tariff page...');
+    await page.goto(LINK_REPORTS_URL, { waitUntil: 'networkidle2', timeout: 60000 });
     
-    console.log(`\n📄 Processing: ${fileName}`);
+    // Wait for page to load
+    await page.waitForSelector('a', { timeout: 30000 });
     
-    // Check if already exists
-    const exists = await fileExists(fileName);
-    if (exists) {
-      console.log(`⏭️ Skipping (already exists): ${fileName}`);
-      skipped++;
-      continue;
+    // Get all download links
+    const links = await page.evaluate(() => {
+      const anchors = document.querySelectorAll('a');
+      const downloadLinks = [];
+      anchors.forEach((a, index) => {
+        const text = a.innerText.trim();
+        const href = a.href;
+        if (text && href && (href.includes('Download') || href.includes('Report') || text.match(/^[IVX]+$|תוספת|קודי|צו/))) {
+          downloadLinks.push({ text, href, index });
+        }
+      });
+      return downloadLinks;
+    });
+    
+    console.log(`📋 Found ${links.length} download links`);
+    
+    // Process each link
+    for (const link of links) {
+      const fileName = `${link.text.replace(/[^a-zA-Z0-9א-ת]/g, '_')}.pdf`;
+      console.log(`\n📄 Processing: ${fileName}`);
+      
+      // Check if exists
+      const exists = await fileExists(fileName);
+      if (exists) {
+        console.log(`⏭️ Skipping (exists): ${fileName}`);
+        skipped++;
+        continue;
+      }
+      
+      try {
+        // Click download link
+        const linkElement = await page.$(`a[href="${link.href}"]`);
+        if (linkElement) {
+          await linkElement.click();
+          
+          // Wait for download
+          await new Promise(resolve => setTimeout(resolve, 10000));
+          
+          // Find downloaded file
+          const files = fs.readdirSync(DOWNLOAD_DIR);
+          const newFile = files.find(f => f.endsWith('.pdf'));
+          
+          if (newFile) {
+            const filePath = path.join(DOWNLOAD_DIR, newFile);
+            const success = await uploadToFirebase(filePath, fileName);
+            
+            if (success) {
+              uploaded++;
+              fs.unlinkSync(filePath); // Clean up
+            } else {
+              failed++;
+            }
+          } else {
+            console.log(`⚠️ No PDF downloaded for: ${link.text}`);
+            failed++;
+          }
+        }
+      } catch (error) {
+        console.error(`❌ Error processing ${link.text}:`, error.message);
+        failed++;
+      }
+      
+      // Delay between downloads
+      await new Promise(resolve => setTimeout(resolve, 3000));
     }
     
-    // Download
-    const fileBuffer = await downloadFile(url);
-    if (!fileBuffer) {
-      console.log(`❌ Failed to download: ${fileName}`);
-      failed++;
-      continue;
-    }
-    
-    // Detect category and upload
-    const { category } = detectCategory(fileName);
-    const docId = await uploadToFirebase(fileName, fileBuffer, category);
-    
-    if (docId) {
-      uploaded++;
-    } else {
-      failed++;
-    }
-    
-    // Small delay between downloads
-    await new Promise(resolve => setTimeout(resolve, 2000));
+  } catch (error) {
+    console.error('❌ Scanner error:', error.message);
+  } finally {
+    await browser.close();
   }
   
   console.log('\n-----------------------------------');
   console.log('📊 SCAN COMPLETE');
   console.log(`✅ Uploaded: ${uploaded}`);
-  console.log(`⏭️ Skipped (existing): ${skipped}`);
+  console.log(`⏭️ Skipped: ${skipped}`);
   console.log(`❌ Failed: ${failed}`);
   console.log('-----------------------------------');
   
@@ -222,21 +204,14 @@ async function runScanner() {
       timestamp: serverTimestamp(),
       uploaded,
       skipped,
-      failed,
-      status: failed === 0 ? 'success' : 'partial'
+      failed
     });
-  } catch (e) {
-    console.log('Could not save log to Firestore');
-  }
+  } catch (e) {}
 }
 
-// Run the scanner
 runScanner()
-  .then(() => {
-    console.log('\n✅ Scanner finished');
-    process.exit(0);
-  })
-  .catch((error) => {
-    console.error('\n❌ Scanner error:', error);
+  .then(() => process.exit(0))
+  .catch((e) => {
+    console.error(e);
     process.exit(1);
   });
