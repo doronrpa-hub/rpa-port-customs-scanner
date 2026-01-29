@@ -14,10 +14,10 @@ const db = getFirestore(app);
 const storage = getStorage(app);
 
 async function uploadToFirebase(buffer, fileName, category) {
-  const path = 'documents/' + category + '/' + Date.now() + '_' + fileName;
-  const storageRef = ref(storage, path);
+  var path = 'documents/' + category + '/' + Date.now() + '_' + fileName;
+  var storageRef = ref(storage, path);
   await uploadBytes(storageRef, buffer, { contentType: 'application/pdf' });
-  const url = await getDownloadURL(storageRef);
+  var url = await getDownloadURL(storageRef);
   await addDoc(collection(db, 'files'), {
     name: fileName,
     size: buffer.length,
@@ -35,17 +35,16 @@ async function uploadToFirebase(buffer, fileName, category) {
 async function run() {
   console.log('Starting scanner...');
   
-  const browser = await puppeteer.launch({
+  var browser = await puppeteer.launch({
     headless: 'new',
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   });
   
-  const page = await browser.newPage();
+  var page = await browser.newPage();
+  var pdfBuffer = null;
   
-  let pdfBuffer = null;
-  
-  page.on('response', async (res) => {
-    const ct = res.headers()['content-type'] || '';
+  page.on('response', async function(res) {
+    var ct = res.headers()['content-type'] || '';
     if (ct.includes('pdf') || ct.includes('octet')) {
       try {
         pdfBuffer = await res.buffer();
@@ -54,6 +53,48 @@ async function run() {
     }
   });
   
-  const URL = 'https://shaarolami-query.customs.mof.gov.il/CustomspilotWeb/he/CustomsBook/Home/LinkReports';
+  var URL = 'https://shaarolami-query.customs.mof.gov.il/CustomspilotWeb/he/CustomsBook/Home/LinkReports';
   
-  await page.goto(URL, { waitUntil: 'networkidle2', timeout: 60000
+  await page.goto(URL, { waitUntil: 'networkidle2', timeout: 60000 });
+  await new Promise(function(r) { setTimeout(r, 3000); });
+  
+  var items = ['I', 'II', 'III', 'IV', 'V'];
+  var uploaded = 0;
+  
+  for (var i = 0; i < items.length; i++) {
+    var item = items[i];
+    console.log('Processing: ' + item);
+    pdfBuffer = null;
+    
+    await page.evaluate(function(t) {
+      var spans = document.querySelectorAll('span');
+      for (var j = 0; j < spans.length; j++) {
+        if (spans[j].innerText.trim() === t) {
+          spans[j].click();
+        }
+      }
+    }, item);
+    
+    await new Promise(function(r) { setTimeout(r, 6000); });
+    
+    if (pdfBuffer && pdfBuffer.length > 5000) {
+      await uploadToFirebase(pdfBuffer, 'Section_' + item + '.pdf', 'tariff');
+      uploaded++;
+    } else {
+      console.log('No PDF for: ' + item);
+    }
+    
+    await page.goto(URL, { waitUntil: 'networkidle2', timeout: 60000 });
+    await new Promise(function(r) { setTimeout(r, 2000); });
+  }
+  
+  await browser.close();
+  console.log('Done. Uploaded: ' + uploaded);
+}
+
+run().then(function() {
+  process.exit(0);
+}).catch(function(e) {
+  console.error(e);
+  process.exit(1);
+});
