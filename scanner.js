@@ -4,6 +4,8 @@ const { getFirestore, collection, addDoc, getDocs, query, where, serverTimestamp
 const { getStorage, ref, uploadBytes, getDownloadURL } = require('firebase/storage');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
+const http = require('http');
 
 // Firebase Config
 const firebaseConfig = {
@@ -38,9 +40,34 @@ async function fileExists(fileName) {
   }
 }
 
-async function uploadToFirebase(filePath, fileName) {
+function downloadFile(url) {
+  return new Promise((resolve, reject) => {
+    const protocol = url.startsWith('https') ? https : http;
+    protocol.get(url, { 
+      headers: { 
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/pdf,*/*'
+      }
+    }, (response) => {
+      if (response.statusCode === 302 || response.statusCode === 301) {
+        // Follow redirect
+        downloadFile(response.headers.location).then(resolve).catch(reject);
+        return;
+      }
+      if (response.statusCode !== 200) {
+        reject(new Error(`HTTP ${response.statusCode}`));
+        return;
+      }
+      const chunks = [];
+      response.on('data', chunk => chunks.push(chunk));
+      response.on('end', () => resolve(Buffer.concat(chunks)));
+      response.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
+async function uploadToFirebase(fileBuffer, fileName) {
   try {
-    const fileBuffer = fs.readFileSync(filePath);
     const category = detectCategory(fileName);
     const timestamp = Date.now();
     const storagePath = `documents/${category}/${timestamp}_${fileName}`;
@@ -68,29 +95,14 @@ async function uploadToFirebase(filePath, fileName) {
   }
 }
 
-async function waitForDownload(directory, timeout = 60000) {
-  const startTime = Date.now();
-  while (Date.now() - startTime < timeout) {
-    const files = fs.readdirSync(directory);
-    const pdfFile = files.find(f => f.endsWith('.pdf') && !f.endsWith('.crdownload'));
-    if (pdfFile) return pdfFile;
-    await new Promise(resolve => setTimeout(resolve, 1000));
-  }
-  return null;
-}
-
 async function runScanner() {
-  console.log('🚀 Starting RPA-PORT Customs Scanner v2');
+  console.log('🚀 Starting RPA-PORT Customs Scanner v3');
   console.log(`📅 Time: ${new Date().toISOString()}`);
   console.log('-----------------------------------');
   
   if (!fs.existsSync(DOWNLOAD_DIR)) {
     fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
   }
-  
-  // Clear download directory
-  const existingFiles = fs.readdirSync(DOWNLOAD_DIR);
-  existingFiles.forEach(f => fs.unlinkSync(path.join(DOWNLOAD_DIR, f)));
   
   console.log('🌐 Launching browser...');
   const browser = await puppeteer.launch({
@@ -99,90 +111,54 @@ async function runScanner() {
   });
   
   const page = await browser.newPage();
-  
-  // Set download behavior
-  const client = await page.target().createCDPSession();
-  await client.send('Page.setDownloadBehavior', {
-    behavior: 'allow',
-    downloadPath: DOWNLOAD_DIR
-  });
-  
-  // Set viewport and user agent
   await page.setViewport({ width: 1920, height: 1080 });
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+  
+  // Track PDF URLs from network requests
+  const pdfUrls = [];
+  
+  page.on('response', async (response) => {
+    const url = response.url();
+    const contentType = response.headers()['content-type'] || '';
+    
+    if (contentType.includes('pdf') || url.includes('.pdf') || url.includes('Download') || url.includes('Report')) {
+      console.log(`🔗 Detected URL: ${url}`);
+      pdfUrls.push(url);
+    }
+  });
+  
+  // Also track new pages/tabs that open
+  browser.on('targetcreated', async (target) => {
+    const url = target.url();
+    if (url && url !== 'about:blank') {
+      console.log(`🔗 New tab URL: ${url}`);
+      pdfUrls.push(url);
+    }
+  });
   
   let uploaded = 0;
   let skipped = 0;
   let failed = 0;
   
+  // Items to download
+  const itemsToDownload = [
+    'הורדת קובץ התעריף',
+    'I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X',
+    'XI', 'XII', 'XIII', 'XIV', 'XV', 'XVI', 'XVII', 'XVIII', 'XIX', 'XX', 'XXI', 'XXII',
+    'קודי הנחה', 'צו מסגרת',
+    'תוספת שניה', 'תוספת שלישית WTO', 'תוספת רביעית', 'תוספת חמישית',
+    'תוספת שישית', 'תוספת שביעית', 'תוספת שמינית', 'תוספת תשיעית',
+    'תוספת עשירית', 'תוספת ארבע עשר', 'תוספת חמש עשר', 'תוספת שש עשר', 'תוספת שבע עשר'
+  ];
+  
   try {
     console.log('📄 Loading customs tariff page...');
     await page.goto(LINK_REPORTS_URL, { waitUntil: 'networkidle0', timeout: 60000 });
+    await new Promise(resolve => setTimeout(resolve, 3000));
     
-    // Wait for dynamic content
-    console.log('⏳ Waiting for dynamic content...');
-    await new Promise(resolve => setTimeout(resolve, 5000));
-    
-    // Take screenshot for debugging
-    await page.screenshot({ path: path.join(DOWNLOAD_DIR, 'page.png'), fullPage: true });
-    console.log('📸 Screenshot saved');
-    
-    // Get page HTML for debugging
-    const pageContent = await page.content();
-    console.log(`📝 Page content length: ${pageContent.length} chars`);
-    
-    // Find all clickable elements with download-related text
-    const downloadButtons = await page.evaluate(() => {
-      const results = [];
-      
-      // Find all links and buttons
-      const elements = document.querySelectorAll('a, button, li, span, div');
-      
-      elements.forEach((el, index) => {
-        const text = el.innerText?.trim() || '';
-        const onclick = el.getAttribute('onclick') || '';
-        const href = el.getAttribute('href') || '';
-        const className = el.className || '';
-        
-        // Match Roman numerals, Hebrew supplement names, etc.
-        const isDownloadLink = 
-          /^I{1,3}$|^IV$|^V$|^VI{1,3}$|^IX$|^X{1,3}$|^XI{1,3}$|^XIV$|^XV$|^XVI{1,3}$|^XIX$|^XX{1,2}$|^XXI{1,2}$/.test(text) ||
-          text.includes('תוספת') ||
-          text.includes('קודי הנחה') ||
-          text.includes('צו מסגרת') ||
-          text.includes('הורדת קובץ') ||
-          onclick.includes('Download') ||
-          href.includes('Download');
-        
-        if (isDownloadLink && text.length > 0 && text.length < 50) {
-          results.push({
-            text: text,
-            tagName: el.tagName,
-            index: index,
-            hasOnclick: onclick.length > 0,
-            hasHref: href.length > 0
-          });
-        }
-      });
-      
-      return results;
-    });
-    
-    console.log(`📋 Found ${downloadButtons.length} potential download elements:`);
-    downloadButtons.forEach(btn => console.log(`   - "${btn.text}" (${btn.tagName})`));
-    
-    if (downloadButtons.length === 0) {
-      // Log all text on page for debugging
-      const allText = await page.evaluate(() => {
-        return Array.from(document.querySelectorAll('li, a')).map(el => el.innerText?.trim()).filter(t => t && t.length < 100);
-      });
-      console.log('📝 Page elements found:', allText.slice(0, 30));
-    }
-    
-    // Process each download button
-    for (const btn of downloadButtons) {
-      const fileName = `${btn.text.replace(/[^a-zA-Z0-9א-ת\s]/g, '').trim()}.pdf`;
-      console.log(`\n📄 Processing: "${btn.text}" -> ${fileName}`);
+    for (const itemName of itemsToDownload) {
+      const fileName = `${itemName.replace(/[^a-zA-Z0-9א-ת\s]/g, '').trim()}.pdf`;
+      console.log(`\n📄 Processing: "${itemName}"`);
       
       const exists = await fileExists(fileName);
       if (exists) {
@@ -192,80 +168,90 @@ async function runScanner() {
       }
       
       try {
-        // Find and click the element
-        const elements = await page.$$('a, button, li, span');
-        let clicked = false;
+        // Clear tracked URLs
+        pdfUrls.length = 0;
         
-        for (const element of elements) {
-          const text = await element.evaluate(el => el.innerText?.trim());
-          if (text === btn.text) {
-            await element.click();
-            clicked = true;
-            console.log(`🖱️ Clicked: "${btn.text}"`);
-            break;
+        // Find and click the element
+        const clicked = await page.evaluate((text) => {
+          const elements = document.querySelectorAll('span, a, li, div');
+          for (const el of elements) {
+            if (el.innerText?.trim() === text) {
+              el.click();
+              return true;
+            }
           }
-        }
+          return false;
+        }, itemName);
         
         if (!clicked) {
-          console.log(`⚠️ Could not find element to click: "${btn.text}"`);
+          console.log(`⚠️ Element not found: "${itemName}"`);
           failed++;
           continue;
         }
         
-        // Wait for download
-        console.log('⏳ Waiting for download...');
-        const downloadedFile = await waitForDownload(DOWNLOAD_DIR, 30000);
+        console.log(`🖱️ Clicked: "${itemName}"`);
         
-        if (downloadedFile) {
-          const filePath = path.join(DOWNLOAD_DIR, downloadedFile);
-          const success = await uploadToFirebase(filePath, fileName);
+        // Wait for response
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        
+        // Check if we got any PDF URLs
+        if (pdfUrls.length > 0) {
+          const pdfUrl = pdfUrls[pdfUrls.length - 1];
+          console.log(`📥 Downloading from: ${pdfUrl}`);
           
-          if (success) {
-            uploaded++;
-          } else {
+          try {
+            const fileBuffer = await downloadFile(pdfUrl);
+            if (fileBuffer && fileBuffer.length > 1000) {
+              const success = await uploadToFirebase(fileBuffer, fileName);
+              if (success) uploaded++;
+              else failed++;
+            } else {
+              console.log(`⚠️ Downloaded file too small or empty`);
+              failed++;
+            }
+          } catch (dlError) {
+            console.log(`⚠️ Download failed: ${dlError.message}`);
             failed++;
           }
-          
-          // Clean up
-          try { fs.unlinkSync(filePath); } catch (e) {}
         } else {
-          console.log(`⚠️ No download received for: "${btn.text}"`);
-          failed++;
+          // Try to get URL from any new pages
+          const pages = await browser.pages();
+          for (const p of pages) {
+            const url = p.url();
+            if (url !== LINK_REPORTS_URL && url !== 'about:blank') {
+              console.log(`📥 Found new page: ${url}`);
+              
+              try {
+                const fileBuffer = await downloadFile(url);
+                if (fileBuffer && fileBuffer.length > 1000) {
+                  const success = await uploadToFirebase(fileBuffer, fileName);
+                  if (success) uploaded++;
+                  else failed++;
+                  await p.close();
+                  break;
+                }
+              } catch (e) {
+                console.log(`⚠️ Could not download from new page`);
+              }
+            }
+          }
+          
+          if (pdfUrls.length === 0) {
+            console.log(`⚠️ No PDF URL detected for: "${itemName}"`);
+            failed++;
+          }
+        }
+        
+        // Go back to main page if needed
+        if (page.url() !== LINK_REPORTS_URL) {
+          await page.goto(LINK_REPORTS_URL, { waitUntil: 'networkidle0', timeout: 60000 });
+          await new Promise(resolve => setTimeout(resolve, 2000));
         }
         
       } catch (error) {
-        console.error(`❌ Error: ${error.message}`);
+        console.error(`❌ Error processing "${itemName}": ${error.message}`);
         failed++;
-      }
-      
-      // Small delay
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    }
-    
-  } catch (error) {
-    console.error('❌ Scanner error:', error.message);
-  } finally {
-    await browser.close();
-  }
-  
-  console.log('\n-----------------------------------');
-  console.log('📊 SCAN COMPLETE');
-  console.log(`✅ Uploaded: ${uploaded}`);
-  console.log(`⏭️ Skipped: ${skipped}`);
-  console.log(`❌ Failed: ${failed}`);
-  console.log('-----------------------------------');
-  
-  try {
-    await addDoc(collection(db, 'scanner_logs'), {
-      timestamp: serverTimestamp(),
-      uploaded, skipped, failed
-    });
-  } catch (e) {}
-}
-
-runScanner()
-  .then(() => process.exit(0))
-  .catch((e) => {
-    console.error(e);
-    process.exit(1);
-  });
+        
+        // Try to recover
+        try {
+          await page.goto(LINK_REPORTS_URL, { waitUntil: 'networkidle0', timeout: 6000
