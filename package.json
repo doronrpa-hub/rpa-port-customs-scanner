@@ -3,9 +3,6 @@
   "version": "2.0.0",
   "description": "API-based scanner for Israeli Customs data",
   "main": "scanner.js",
-  "scripts": {
-    "scan": "node scanner.js"
-  },
   "dependencies": {
     "firebase": "^10.7.1"
   }
